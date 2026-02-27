@@ -10,6 +10,7 @@ import math
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from level_detector.indicator import DEFAULT_LEVEL_PARAMS, find_levels
 
@@ -20,6 +21,9 @@ DEFAULT_SESSION_WINDOWS: tuple[tuple[int, int], ...] = (
     (12, 21),  # New York session hours in UTC
 )
 DEFAULT_TRADE_WINDOW_DAYS = (4, 25)
+MIN_STOP_DISTANCE = 0.20
+MIN_TP_SL_RATIO = 0.5  # TP must be at least half the SL distance
+MAX_TP_SL_RATIO = 2.0  # TP cannot be more than 2x the SL distance
 
 
 @dataclass(slots=True)
@@ -36,6 +40,8 @@ class BacktestConfig:
     trade_start_day: int | None = DEFAULT_TRADE_WINDOW_DAYS[0]
     trade_end_day: int | None = DEFAULT_TRADE_WINDOW_DAYS[1]
     flat_before_friday_close: bool = True
+    trade_month_span: int = 2
+    strategy: Literal["trend", "mirror"] = "trend"
 
 
 @dataclass(slots=True)
@@ -57,8 +63,10 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
     data_root = config.data_root or (project_root.parent / "data")
     if config.history_months < 1:
         raise ValueError("history_months must be at least 1.")
+    if config.trade_month_span < 1:
+        raise ValueError("trade_month_span must be at least 1.")
 
-    month_sequence = _month_sequence(config.month, config.history_months)
+    month_sequence = _data_months(config.month, config.history_months, config.trade_month_span)
 
     minute_dir = data_root / "minute_monthly"
     minute_paths = [minute_dir / f"CL_1m_{month}.csv" for month in month_sequence]
@@ -70,6 +78,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         )
 
     minute_df = _load_minute_bars(minute_paths)
+    minute_df = _add_indicator_columns(minute_df)
 
     if config.levels_csv:
         if not config.levels_csv.exists():
@@ -120,6 +129,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         config.month,
         config.trade_start_day,
         config.trade_end_day,
+        config.trade_month_span,
     )
 
     for _, bar in minute_df.iterrows():
@@ -127,6 +137,13 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
         bid_high = float(bar["high"])
         bid_low = float(bar["low"])
         close_price = float(bar["close"])
+        indicator_snapshot = {
+            "close": close_price,
+            "rsi": bar.get("rsi"),
+            "ema_20": bar.get("ema_20"),
+            "ema_50": bar.get("ema_50"),
+            "ema_200": bar.get("ema_200"),
+        }
 
         while next_level_idx < len(level_records) and level_records[next_level_idx]["time"] <= ts:
             level_records[next_level_idx]["consumed"] = False
@@ -184,6 +201,7 @@ def run_backtest(config: BacktestConfig) -> BacktestResult:
                 timestamp=ts,
                 trade_counter=trade_counter,
                 config=config,
+                indicators=indicator_snapshot,
             )
             if newly_opened:
                 trade_counter += 1
@@ -238,16 +256,54 @@ def _maybe_open_trade(
     timestamp: pd.Timestamp,
     trade_counter: int,
     config: BacktestConfig,
+    indicators: dict | None = None,
+) -> dict | None:
+    if config.strategy == "mirror":
+        return _maybe_open_trade_mirror(
+            pending_levels=pending_levels,
+            level_records=level_records,
+            bid_high=bid_high,
+            bid_low=bid_low,
+            timestamp=timestamp,
+            trade_counter=trade_counter,
+            config=config,
+            indicators=indicators,
+        )
+    return _maybe_open_trade_trend(
+        pending_levels=pending_levels,
+        level_records=level_records,
+        bid_high=bid_high,
+        bid_low=bid_low,
+        timestamp=timestamp,
+        trade_counter=trade_counter,
+        config=config,
+        indicators=indicators,
+    )
+
+
+def _maybe_open_trade_trend(
+    pending_levels: list[dict],
+    level_records: list[dict],
+    bid_high: float,
+    bid_low: float,
+    timestamp: pd.Timestamp,
+    trade_counter: int,
+    config: BacktestConfig,
+    indicators: dict | None = None,
 ) -> dict | None:
     spread = config.spread
     ask_low = bid_low + spread
     ask_high = bid_high + spread
+    if indicators and not _indicators_allow_environment_trend(indicators):
+        return None
     for level in pending_levels:
         if level.get("consumed"):
             continue
         entry_price = _round_price(float(level["level"]))
         if level["level_type"] == "support":
             if ask_low <= entry_price <= ask_high:
+                if not _indicators_allow_side_trend("long", indicators):
+                    continue
                 trade_id = trade_counter + 1
                 level["consumed"] = True
                 take_profit, stop_loss = _resolve_targets(
@@ -256,6 +312,7 @@ def _maybe_open_trade(
                     side="long",
                     timestamp=timestamp,
                     config=config,
+                    indicators=indicators,
                 )
                 return {
                     "id": trade_id,
@@ -272,6 +329,8 @@ def _maybe_open_trade(
                 }
         else:
             if bid_low <= entry_price <= bid_high:
+                if not _indicators_allow_side_trend("short", indicators):
+                    continue
                 trade_id = trade_counter + 1
                 level["consumed"] = True
                 take_profit, stop_loss = _resolve_targets(
@@ -280,11 +339,88 @@ def _maybe_open_trade(
                     side="short",
                     timestamp=timestamp,
                     config=config,
+                    indicators=indicators,
                 )
                 return {
                     "id": trade_id,
                     "side": "short",
                     "direction": -1.0,
+                    "entry_time": timestamp,
+                    "entry_price": entry_price,
+                    "level_price": entry_price,
+                    "level_type": "resistance",
+                    "level_row": int(level.get("row", -1)),
+                    "level_time": level["time"],
+                    "take_profit": take_profit,
+                    "stop_loss": stop_loss,
+                }
+    return None
+
+
+def _maybe_open_trade_mirror(
+    pending_levels: list[dict],
+    level_records: list[dict],
+    bid_high: float,
+    bid_low: float,
+    timestamp: pd.Timestamp,
+    trade_counter: int,
+    config: BacktestConfig,
+    indicators: dict | None = None,
+) -> dict | None:
+    spread = config.spread
+    ask_low = bid_low + spread
+    ask_high = bid_high + spread
+    if indicators and not _indicators_allow_environment_trend(indicators):
+        return None
+    for level in pending_levels:
+        if level.get("consumed"):
+            continue
+        entry_price = _round_price(float(level["level"]))
+        if level["level_type"] == "support":
+            if ask_low <= entry_price <= ask_high:
+                if not _indicators_allow_side_trend("long", indicators):
+                    continue
+                trade_id = trade_counter + 1
+                level["consumed"] = True
+                take_profit, stop_loss = _resolve_targets(
+                    level_records=level_records,
+                    entry_level=level,
+                    side="short",
+                    timestamp=timestamp,
+                    config=config,
+                    indicators=indicators,
+                )
+                return {
+                    "id": trade_id,
+                    "side": "short",
+                    "direction": -1.0,
+                    "entry_time": timestamp,
+                    "entry_price": entry_price,
+                    "level_price": entry_price,
+                    "level_type": "support",
+                    "level_row": int(level.get("row", -1)),
+                    "level_time": level["time"],
+                    "take_profit": take_profit,
+                    "stop_loss": stop_loss,
+                }
+        else:
+            if bid_low <= entry_price <= bid_high:
+                if not _indicators_allow_side_trend("short", indicators):
+                    continue
+                trade_id = trade_counter + 1
+                level["consumed"] = True
+                take_profit, stop_loss = _resolve_targets(
+                    level_records=level_records,
+                    entry_level=level,
+                    side="long",
+                    timestamp=timestamp,
+                    config=config,
+                    indicators=indicators,
+                )
+                return {
+                    "id": trade_id,
+                    "side": "long",
+                    "direction": 1.0,
                     "entry_time": timestamp,
                     "entry_price": entry_price,
                     "level_price": entry_price,
@@ -303,6 +439,7 @@ def _resolve_targets(
     side: Side,
     timestamp: pd.Timestamp,
     config: BacktestConfig,
+    indicators: dict | None = None,
 ) -> tuple[float, float]:
     entry_price = _round_price(float(entry_level["level"]))
     if side == "long":
@@ -316,9 +453,33 @@ def _resolve_targets(
         default_tp = entry_price - config.take_profit_offset
         default_sl = entry_price + config.stop_loss_offset
 
-    take_profit = _round_price(tp if tp is not None else default_tp)
-    stop_loss = _round_price(sl if sl is not None else default_sl)
-    return take_profit, stop_loss
+    take_profit = float(tp if tp is not None else default_tp)
+    stop_loss = float(sl if sl is not None else default_sl)
+    tp_dist = abs(take_profit - entry_price)
+    sl_dist = abs(stop_loss - entry_price)
+
+    if _is_opening_window(timestamp):
+        tp_dist *= 0.5
+        sl_dist *= 0.5
+
+    tp_dist, sl_dist = _enforce_distance_rules(tp_dist, sl_dist)
+    tp_dist, sl_dist = _apply_strategy_adjustments(
+        strategy=config.strategy,
+        side=side,
+        tp_distance=tp_dist,
+        sl_distance=sl_dist,
+        indicators=indicators,
+    )
+    tp_dist, sl_dist = _enforce_distance_rules(tp_dist, sl_dist)
+
+    if side == "long":
+        take_profit = entry_price + tp_dist
+        stop_loss = entry_price - sl_dist
+    else:
+        take_profit = entry_price - tp_dist
+        stop_loss = entry_price + sl_dist
+
+    return _round_price(take_profit), _round_price(stop_loss)
 
 
 def _closest_level_price(
@@ -364,6 +525,159 @@ def _closest_level_price(
     return best
 
 
+def _enforce_distance_rules(tp_distance: float, sl_distance: float) -> tuple[float, float]:
+    tp_distance = max(tp_distance, 0.0)
+    sl_distance = max(sl_distance, MIN_STOP_DISTANCE)
+    if sl_distance == 0:
+        sl_distance = MIN_STOP_DISTANCE
+
+    ratio = tp_distance / sl_distance if sl_distance else None
+    if ratio is None:
+        return tp_distance, sl_distance
+
+    if ratio > MAX_TP_SL_RATIO:
+        tp_distance = sl_distance * MAX_TP_SL_RATIO
+    elif ratio < MIN_TP_SL_RATIO:
+        sl_cap = tp_distance / MIN_TP_SL_RATIO if MIN_TP_SL_RATIO else sl_distance
+        if sl_cap >= MIN_STOP_DISTANCE:
+            sl_distance = min(sl_distance, sl_cap)
+        sl_distance = max(sl_distance, MIN_STOP_DISTANCE)
+        ratio = tp_distance / sl_distance if sl_distance else MIN_TP_SL_RATIO
+        if ratio < MIN_TP_SL_RATIO:
+            tp_distance = sl_distance * MIN_TP_SL_RATIO
+    return tp_distance, sl_distance
+
+
+def _apply_strategy_adjustments(
+    strategy: Literal["trend", "mirror"],
+    side: Side,
+    tp_distance: float,
+    sl_distance: float,
+    indicators: dict | None,
+) -> tuple[float, float]:
+    if not indicators:
+        return tp_distance, sl_distance
+    rsi = _indicator_value(indicators, "rsi")
+    if strategy == "mirror":
+        strategy = "trend"
+
+    if side == "long":
+        if rsi is not None and rsi >= 60 and _price_above_all_emas(indicators):
+            tp_distance *= 0.85
+            sl_distance *= 1.1
+        elif rsi is not None and rsi < 50:
+            tp_distance *= 0.9
+    else:
+        if rsi is not None and rsi <= 40 and _price_below_all_emas(indicators):
+            tp_distance *= 0.85
+            sl_distance *= 1.1
+        elif rsi is not None and rsi > 50:
+            tp_distance *= 0.8
+            sl_distance *= 0.9
+    return tp_distance, sl_distance
+
+
+def _indicator_value(indicators: dict, key: str) -> float | None:
+    if not indicators:
+        return None
+    value = indicators.get(key)
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _price_above_all_emas(indicators: dict) -> bool:
+    close = _indicator_value(indicators, "close")
+    if close is None:
+        return False
+    emas = [_indicator_value(indicators, f"ema_{span}") for span in (20, 50, 200)]
+    valid = [ema for ema in emas if ema is not None]
+    if not valid:
+        return False
+    return all(close >= ema for ema in valid)
+
+
+def _price_below_all_emas(indicators: dict) -> bool:
+    close = _indicator_value(indicators, "close")
+    if close is None:
+        return False
+    emas = [_indicator_value(indicators, f"ema_{span}") for span in (20, 50, 200)]
+    valid = [ema for ema in emas if ema is not None]
+    if not valid:
+        return False
+    return all(close <= ema for ema in valid)
+
+
+def _indicators_allow_environment_trend(indicators: dict) -> bool:
+    rsi = _indicator_value(indicators, "rsi")
+    if rsi is not None and rsi < 40 and _price_below_all_emas(indicators):
+        return False
+    return True
+
+
+def _indicators_allow_side_trend(side: Side, indicators: dict | None) -> bool:
+    if not indicators:
+        return True
+    if side == "long":
+        return _allow_long_trend(indicators)
+    return _allow_short_trend(indicators)
+
+
+def _allow_long_trend(indicators: dict) -> bool:
+    rsi = _indicator_value(indicators, "rsi")
+    if rsi is not None:
+        if rsi < 40:
+            return False
+        if rsi > 85:
+            return False
+    ema20 = _indicator_value(indicators, "ema_20")
+    ema50 = _indicator_value(indicators, "ema_50")
+    ema200 = _indicator_value(indicators, "ema_200")
+    fast_vs_slow = False
+    if ema20 is not None and ema200 is not None and ema20 > ema200:
+        fast_vs_slow = True
+    if ema50 is not None and ema200 is not None and ema50 > ema200:
+        fast_vs_slow = True
+    if not fast_vs_slow:
+        return False
+    close = _indicator_value(indicators, "close")
+    if close is not None:
+        if ema20 is not None and close < ema20:
+            return False
+        if ema50 is not None and close < ema50 and ema20 is None:
+            return False
+    return True
+
+
+def _allow_short_trend(indicators: dict) -> bool:
+    rsi = _indicator_value(indicators, "rsi")
+    if rsi is not None and rsi > 50:
+        return False
+    close = _indicator_value(indicators, "close")
+    ema20 = _indicator_value(indicators, "ema_20")
+    ema50 = _indicator_value(indicators, "ema_50")
+    ema200 = _indicator_value(indicators, "ema_200")
+    if ema20 is not None and ema50 is not None:
+        if not (ema20 < ema50):
+            return False
+    if ema50 is not None and ema200 is not None:
+        if not (ema50 < ema200):
+            return False
+    if close is not None and ema20 is not None and close >= ema20:
+        return False
+    if close is not None and ema200 is not None and close >= ema200:
+        return False
+    return True
+
+
 def _evaluate_exit(
     trade: dict,
     bid_high: float,
@@ -395,6 +709,10 @@ def _is_friday_close(ts: pd.Timestamp) -> bool:
     return ts.weekday() == 4 and ts.hour == 23 and ts.minute == 59
 
 
+def _is_opening_window(ts: pd.Timestamp) -> bool:
+    return 7 <= ts.hour < 9
+
+
 def _load_minute_bars(csv_paths: list[Path]) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for path in csv_paths:
@@ -414,6 +732,17 @@ def _load_minute_bars(csv_paths: list[Path]) -> pd.DataFrame:
     combined.sort_values("datetime", inplace=True)
     combined.reset_index(drop=True, inplace=True)
     return combined
+
+
+def _add_indicator_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
+    df["rsi"] = _compute_rsi(df["close"], period=14)
+    return df
 
 
 def _load_levels(csv_paths: list[Path]) -> pd.DataFrame:
@@ -469,6 +798,17 @@ def _month_sequence(target_month: str, history_months: int) -> list[str]:
     ]
 
 
+def _data_months(target_month: str, history_months: int, trade_month_span: int) -> list[str]:
+    base = datetime.strptime(target_month, "%Y-%m")
+    offsets = range(-(history_months - 1), trade_month_span)
+    seen: list[str] = []
+    for offset in offsets:
+        label = _shift_month(base, offset).strftime("%Y-%m")
+        if label not in seen:
+            seen.append(label)
+    return seen
+
+
 def _month_bounds(month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
     base = datetime.strptime(month, "%Y-%m")
     start = pd.Timestamp(base)
@@ -480,10 +820,12 @@ def _trade_window_bounds(
     month: str,
     start_day: int | None,
     end_day: int | None,
+    month_span: int,
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
     month_start, month_end = _month_bounds(month)
     window_start = month_start
-    window_end = month_end
+    final_month_end = pd.Timestamp(_shift_month(month_start.to_pydatetime(), month_span))
+    window_end = final_month_end
     if start_day is not None:
         if start_day < 1:
             raise ValueError("trade_start_day must be at least 1.")
@@ -491,10 +833,25 @@ def _trade_window_bounds(
     if end_day is not None:
         if end_day < 1:
             raise ValueError("trade_end_day must be at least 1.")
-        window_end = min(month_start + pd.Timedelta(days=end_day), month_end)
+        last_month_start = pd.Timestamp(_shift_month(month_start.to_pydatetime(), month_span - 1))
+        window_end = min(last_month_start + pd.Timedelta(days=end_day), final_month_end)
     if window_start >= window_end:
         raise ValueError("Trade window start must be before its end.")
     return window_start, window_end
+
+
+def _plot_window_bounds(config: BacktestConfig) -> tuple[pd.Timestamp, pd.Timestamp]:
+    plot_start, _ = _month_bounds(config.month)
+    plot_end = pd.Timestamp(_shift_month(plot_start.to_pydatetime(), config.trade_month_span))
+    return plot_start, plot_end
+
+
+def _format_month_label(start_month: str, span: int) -> str:
+    if span <= 1:
+        return start_month
+    base = datetime.strptime(start_month, "%Y-%m")
+    end_month = _shift_month(base, span - 1).strftime("%Y-%m")
+    return f"{start_month} to {end_month}"
 
 
 def _in_trading_session(ts: pd.Timestamp, sessions: tuple[tuple[int, int], ...] | None) -> bool:
@@ -558,46 +915,101 @@ def save_trade_plot(result: BacktestResult) -> Path:
     base_dir = result.config.output_dir or (project_root / "outputs")
     plot_dir = base_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    month_start, month_end = _month_bounds(result.config.month)
-    month_minutes = result.minute_bars[
-        (result.minute_bars["datetime"] >= month_start)
-        & (result.minute_bars["datetime"] < month_end)
+    plot_start, plot_end = _plot_window_bounds(result.config)
+    plot_minutes = result.minute_bars[
+        (result.minute_bars["datetime"] >= plot_start)
+        & (result.minute_bars["datetime"] < plot_end)
     ].copy()
-    if month_minutes.empty:
-        raise ValueError(f"No minute data within {result.config.month}.")
-    fig = _build_trade_figure(month_minutes, result.trades, result.config.month)
+    if plot_minutes.empty:
+        raise ValueError(f"No minute data within specified plot window for {result.config.month}.")
+    label = _format_month_label(result.config.month, result.config.trade_month_span)
+    fig = _build_trade_figure(plot_minutes, result.trades, label)
     html_path = plot_dir / f"trades_{result.config.month}.html"
     fig.write_html(html_path, include_plotlyjs="cdn", full_html=True)
     return html_path
 
 
 def _build_trade_figure(minute_df: pd.DataFrame, trades_df: pd.DataFrame, label_month: str) -> go.Figure:
-    fig = go.Figure(
-        data=[
-            go.Candlestick(
-                name="CL 1m",
-                x=minute_df["datetime"],
-                open=minute_df["open"],
-                high=minute_df["high"],
-                low=minute_df["low"],
-                close=minute_df["close"],
-                increasing_line_color="#26a69a",
-                decreasing_line_color="#ef5350",
-                increasing_fillcolor="#26a69a",
-                decreasing_fillcolor="#ef5350",
-                opacity=0.9,
-            )
-        ]
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        row_heights=[0.75, 0.25],
+        vertical_spacing=0.03,
+        subplot_titles=(f"CL 1m trades for {label_month}", "RSI (14)"),
     )
 
+    fig.add_trace(
+        go.Candlestick(
+            name="CL 1m",
+            x=minute_df["datetime"],
+            open=minute_df["open"],
+            high=minute_df["high"],
+            low=minute_df["low"],
+            close=minute_df["close"],
+            increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+            increasing_fillcolor="#26a69a",
+            decreasing_fillcolor="#ef5350",
+            opacity=0.9,
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+
+    ema_settings = (
+        (20, "#42a5f5"),
+        (50, "#ab47bc"),
+        (200, "#8d6e63"),
+    )
+    for period, color in ema_settings:
+        ema_series = minute_df["close"].ewm(span=period, adjust=False).mean()
+        fig.add_trace(
+            go.Scatter(
+                name=f"EMA {period}",
+                x=minute_df["datetime"],
+                y=ema_series,
+                mode="lines",
+                line=dict(color=color, width=1.2),
+            ),
+            row=1,
+            col=1,
+        )
+
+    rsi_series = _compute_rsi(minute_df["close"], period=14)
+    fig.add_trace(
+        go.Scatter(
+            name="RSI",
+            x=minute_df["datetime"],
+            y=rsi_series,
+            mode="lines",
+            line=dict(color="#ffd54f", width=1.5),
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+    for level, color in ((70, "#ef5350"), (30, "#26a69a")):
+        fig.add_shape(
+            type="line",
+            xref="x",
+            yref="y2",
+            x0=minute_df["datetime"].iloc[0],
+            x1=minute_df["datetime"].iloc[-1],
+            y0=level,
+            y1=level,
+            line=dict(color=color, width=1, dash="dash"),
+        )
+
     fig.update_layout(
-        title=f"CL 1m trades for {label_month}",
         xaxis_title="Time",
         yaxis_title="Price",
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+    fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
 
     if trades_df.empty:
         return fig
@@ -659,6 +1071,19 @@ def _build_trade_figure(minute_df: pd.DataFrame, trades_df: pd.DataFrame, label_
         )
 
     return fig
+
+
+def _compute_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    if prices.empty:
+        return pd.Series(dtype=float)
+    delta = prices.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.bfill().fillna(50)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -730,6 +1155,18 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip flattening positions before Friday ends.",
     )
+    parser.add_argument(
+        "--trade-month-span",
+        type=int,
+        default=2,
+        help="Number of consecutive months (starting at --month) during which trades may occur.",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=("trend", "mirror"),
+        default="trend",
+        help="Select the trading logic: 'trend' (support/res trend-following) or 'mirror' (inverted entries).",
+    )
     return parser.parse_args()
 
 
@@ -748,6 +1185,8 @@ def main() -> None:
         trade_end_day=args.trade_end_day,
         trading_sessions=None if args.disable_session_filter else DEFAULT_SESSION_WINDOWS,
         flat_before_friday_close=not args.keep_weekend_positions,
+        trade_month_span=args.trade_month_span,
+        strategy=args.strategy,
     )
     result = run_backtest(cfg)
     trades_path, equity_path = save_result(result)

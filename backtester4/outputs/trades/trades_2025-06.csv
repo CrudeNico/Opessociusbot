@@ -1,0 +1,6 @@
+trade_id,side,entry_time,exit_time,entry_price,exit_price,take_profit,stop_loss,exit_reason,pnl,level_type,cluster_size
+1,short,2025-06-03 07:01:00,2025-06-03 12:07:00,62.785,63.27,62.158,63.27,stop_loss,-0.485,resistance,2
+2,short,2025-06-03 12:14:00,2025-06-03 14:45:00,63.27,63.725,62.158,63.725,stop_loss,-0.455,resistance,2
+3,short,2025-06-04 07:22:00,2025-06-04 09:55:00,63.3333,63.725,62.785,63.725,stop_loss,-0.3917,resistance,3
+4,short,2025-06-05 12:46:00,2025-06-05 12:58:00,63.3333,63.725,62.785,63.725,stop_loss,-0.3917,resistance,3
+5,long,2025-06-24 16:38:00,2025-06-30 23:59:00,64.3733,64.92,74.185,63.31,end_of_data,0.5467,support,3
