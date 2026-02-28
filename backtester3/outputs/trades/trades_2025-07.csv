@@ -1,3 +1,0 @@
-trade_id,side,entry_time,exit_time,entry_price,exit_price,take_profit,stop_loss,exit_reason,pnl,level_type,cluster_size
-1,long,2025-07-01 10:41:00,2025-07-01 12:57:00,65.6025,65.925,65.925,64.65,take_profit,0.3225,resistance,4
-2,long,2025-07-01 12:58:00,2025-07-31 23:59:00,65.925,69.37,74.185,64.65,end_of_data,3.445,resistance,2

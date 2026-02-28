@@ -1,6 +1,0 @@
-trade_id,side,entry_time,exit_time,entry_price,exit_price,take_profit,stop_loss,exit_reason,pnl,level_type,cluster_size
-1,short,2025-03-12 08:20:00,2025-03-12 16:10:00,66.715,67.86,66.185,67.86,stop_loss,-1.145,resistance,2
-2,long,2025-03-12 16:27:00,2025-03-19 08:36:00,67.86,66.185,68.9767,66.185,stop_loss,-1.675,support,2
-3,long,2025-03-19 08:59:00,2025-03-19 10:23:00,66.1733,66.535,66.535,65.44,take_profit,0.3617,support,3
-4,short,2025-03-20 14:13:00,2025-03-20 20:33:00,67.735,68.3633,66.5,68.3633,stop_loss,-0.6283,resistance,4
-5,short,2025-03-25 15:24:00,2025-03-26 15:03:00,68.9625,70.14,68.41,70.14,stop_loss,-1.1775,resistance,4

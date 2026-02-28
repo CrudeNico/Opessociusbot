@@ -1,2 +1,0 @@
-trade_id,side,entry_time,exit_time,entry_price,exit_price,take_profit,stop_loss,exit_reason,pnl,level_type,cluster_size
-1,long,2024-08-29 13:29:00,2024-08-30 13:00:00,75.8967,75.26,77.0,75.26,stop_loss,-0.6367,resistance,3

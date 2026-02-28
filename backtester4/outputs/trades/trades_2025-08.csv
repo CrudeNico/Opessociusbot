@@ -1,4 +1,0 @@
-trade_id,side,entry_time,exit_time,entry_price,exit_price,take_profit,stop_loss,exit_reason,pnl,level_type,cluster_size
-1,long,2025-08-05 12:15:00,2025-08-06 13:10:00,65.2267,66.375,66.375,64.88,take_profit,1.1483,support,3
-2,long,2025-08-06 15:54:00,2025-08-06 15:56:00,65.27,64.88,66.98,64.88,stop_loss,-0.39,support,4
-3,long,2025-08-12 11:26:00,2025-08-12 16:34:00,63.7167,63.12,64.88,63.12,stop_loss,-0.5967,support,3
