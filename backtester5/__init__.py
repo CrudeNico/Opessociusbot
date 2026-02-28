@@ -391,7 +391,8 @@ def _simulate_trades(report: LevelReport):
             exit_reason, exit_price = _check_exit_extreme(trade, bar, cfg)
             if exit_reason:
                 exit_price = _round(exit_price)
-                pnl = _round(trade['direction'] * (exit_price - trade['entry_price']))
+                price_diff = trade['direction'] * (exit_price - trade['entry_price'])
+                pnl = _round(price_diff * trade['position_size'])
                 equity = _round(equity + pnl)
                 trades.append(
                     {
@@ -408,6 +409,7 @@ def _simulate_trades(report: LevelReport):
                         'level_type': trade['level_type'],
                         'cluster_size': trade['cluster_size'],
                         'level_order': trade['level_order'],
+                        'position_size': trade['position_size'],
                     }
                 )
                 equity_curve.append({'timestamp': ts, 'equity': equity})
@@ -434,6 +436,7 @@ def _simulate_trades(report: LevelReport):
                 trade_id += 1
                 entry_price = _round(level['price'])
                 take_profit = _round(level['tp'])
+                position_size = _calc_position_size(equity, level['order'], cfg)
                 trade = {
                     'trade_id': trade_id,
                     'side': 'long',
@@ -448,6 +451,7 @@ def _simulate_trades(report: LevelReport):
                     'level_day': day_date,
                     'break_price': level.get('break_price'),
                     'breakeven_active': False,
+                    'position_size': position_size,
                 }
                 active_trades.append(trade)
                 level['used'] = True
@@ -462,6 +466,7 @@ def _simulate_trades(report: LevelReport):
                 trade_id += 1
                 entry_price = _round(level['price'])
                 take_profit = _round(level['tp'])
+                position_size = _calc_position_size(equity, level['order'], cfg)
                 trade = {
                     'trade_id': trade_id,
                     'side': 'short',
@@ -476,6 +481,7 @@ def _simulate_trades(report: LevelReport):
                     'level_day': day_date,
                     'break_price': None,
                     'breakeven_active': False,
+                    'position_size': position_size,
                 }
                 active_trades.append(trade)
                 level['used'] = True
@@ -492,7 +498,8 @@ def _simulate_trades(report: LevelReport):
                 exit_price = _round(last_close)
             else:
                 exit_price = _round(last_close + cfg.spread)
-            pnl = _round(trade['direction'] * (exit_price - trade['entry_price']))
+            price_diff = trade['direction'] * (exit_price - trade['entry_price'])
+            pnl = _round(price_diff * trade['position_size'])
             equity = _round(equity + pnl)
             trades.append(
                 {
@@ -509,6 +516,7 @@ def _simulate_trades(report: LevelReport):
                     'level_type': trade['level_type'],
                     'cluster_size': trade['cluster_size'],
                     'level_order': trade['level_order'],
+                    'position_size': trade['position_size'],
                 }
             )
         equity_curve.append({'timestamp': last_ts, 'equity': equity})
@@ -592,6 +600,19 @@ def _activate_support_breakeven(trade: dict):
     trade['breakeven_active'] = True
 
 
+def _calc_position_size(equity: float, level_order: int, cfg: Config) -> float:
+    base_equity = max(equity, 0.01)
+    desired_gain = base_equity * 0.005
+    if cfg.take_profit_distance <= 0:
+        return 0.0
+    base_size = (desired_gain / cfg.take_profit_distance) * 0.5
+    if level_order == 1:
+        multiplier = 1.0
+    else:
+        multiplier = 2.0
+    return base_size * multiplier
+
+
 def _support_touched(price: float, bar: pd.Series, cfg: Config) -> bool:
     bid_low = float(bar['low'])
     bid_high = float(bar['high'])
@@ -657,6 +678,7 @@ def _trade_columns():
         'level_type',
         'cluster_size',
         'level_order',
+        'position_size',
     ]
 
 
